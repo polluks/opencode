@@ -3,6 +3,7 @@ import {
   batch,
   createEffect,
   createMemo,
+  createRoot,
   For,
   Match,
   on,
@@ -49,6 +50,7 @@ import {
   sortedRootSessions,
   toggleHomeProjectSelection,
 } from "@/pages/layout/helpers"
+import { loadSession } from "@/pages/session-module"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import { sessionTitle } from "@/utils/session-title"
 import { pathKey } from "@/utils/path-key"
@@ -58,6 +60,8 @@ import { ServerRowMenu } from "@/components/server/server-row-menu"
 import { ServerHealthIndicator } from "@/components/server/server-row"
 import { type ServerHealth } from "@/utils/server-health"
 import { Persist, persisted } from "@/utils/persist"
+import { useMarked } from "@opencode-ai/ui/context/marked"
+import { preloadMarkdown } from "@opencode-ai/ui/markdown-cache"
 
 const HOME_SESSION_LIMIT = 64
 const HOME_ROW_LAYOUT =
@@ -134,10 +138,12 @@ export function NewHome() {
   const server = useServer()
   const language = useLanguage()
   const global = useGlobal()
+  const tabs = useTabs()
   const command = useCommand()
   const notification = useNotification()
-  const tabs = useTabs()
+  const marked = useMarked()
   let focusSessionSearch: (() => void) | undefined
+  onMount(() => void loadSession())
   const [state, setState] = createStore({
     search: "",
     selection: { server: server.key } as HomeProjectSelection,
@@ -199,6 +205,41 @@ export function NewHome() {
   })
   const searchOpen = createMemo(() => state.searchFocused && search().length > 0)
   const groups = createMemo(() => groupSessions(records(), language))
+  const prefetched = new Set<string>()
+
+  createEffect(() => {
+    const ctx = focusedServerCtx()
+    if (!ctx) return
+    records()
+      .slice(0, 2)
+      .forEach((record) => {
+        const key = `${ServerConnection.key(focusedServer()!)}\0${record.session.id}`
+        if (prefetched.has(key)) return
+        prefetched.add(key)
+        createRoot((dispose) => {
+          try {
+            const directory = ctx.sync.createDirSyncContext(record.session.directory)
+            void directory.session
+              .sync(record.session.id)
+              .then(() => {
+                const store = ctx.sync.child(record.session.directory)[0]
+                return Promise.all(
+                  (store.message[record.session.id] ?? []).flatMap((message) =>
+                    (store.part[message.id] ?? []).flatMap((part) => {
+                      if (part.type !== "text" || !part.text) return []
+                      return preloadMarkdown(part.text, part.id, marked)
+                    }),
+                  ),
+                )
+              })
+              .catch(() => {})
+              .finally(dispose)
+          } catch {
+            dispose()
+          }
+        })
+      })
+  })
 
   function setSelection(next: HomeProjectSelection) {
     batch(() => {
@@ -304,6 +345,13 @@ export function NewHome() {
     if (!conn) return
     const directory = project?.worktree ?? session.directory
     const ctx = global.createServerCtx(conn)
+    global.sessionPlacement.set({
+      server: ServerConnection.key(conn),
+      leafID: session.id,
+      rootID: session.id,
+      directory: session.directory,
+    })
+    tabs.addSessionTab({ server: ServerConnection.key(conn), sessionId: session.id })
     ctx.projects.open(directory)
     ctx.projects.touch(directory)
     startTransition(() => {
